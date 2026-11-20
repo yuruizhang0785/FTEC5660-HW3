@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import csv
 import json
+import math
 import sqlite3
 import threading
 import zlib
@@ -14,9 +15,18 @@ from pathlib import Path
 from typing import Any
 
 
-MODEL_NAME = "deepseek-v4-flash"
+MODEL_NAME = "DeepSeek-V4.1-Flash-1017"
+DEFAULT_API_BASE_URL = "https://www.moyu.cn/v1"
 INTERVIEW_LIMIT = 10
 MAX_SQL_ROWS = 50
+JUDGMENT_LENSES = (
+    "Inductive: look for a consistent pattern across the supplied measures and evidence.",
+    "Abductive and causal: assess whether recent product commercialization plausibly reflects effective R&D, without claiming causation from correlation alone.",
+    "Analogical: compare the company with its industry benchmark and consider how strong or weak the difference is in context.",
+    "Probabilistic: weigh evidence quality, consistency, and proximity to the benchmark; express uncertainty in the rationale.",
+    "Counterfactual: consider whether a modest change in the supplied evidence would change the conclusion, without performing new arithmetic.",
+)
+MIN_VALID_JUDGMENTS = len(JUDGMENT_LENSES) // 2 + 1
 
 # Philip Fisher, "Common Stocks and Uncommon Profits", Part One, Chapter 3.
 # For every point, PASS means the company looks good on it. You choose 3
@@ -57,60 +67,162 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 3, 7]
 
 
 def build_agent() -> Any:
-    """Create and return your model or agent once.
+    """One DeepSeek model judges the interview evidence for Fisher point 7."""
+    import os
+    from langchain_deepseek import ChatDeepSeek
 
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
+    return ChatDeepSeek(
+        model=MODEL_NAME,
+        temperature=0,
+        base_url=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_API_BASE_URL),
+        max_retries=3,
+    )
 
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
-    """
-    ### YOUR CODE HERE
-    return None
+
+def _single_sql_row(tool: Any, query: str) -> dict[str, float]:
+    """Parse one aggregate row returned by the provided SQL tool."""
+    lines = tool.invoke({"query": query}).strip().splitlines()
+    if len(lines) != 2 or lines[0].startswith("SQL error"):
+        raise ValueError(f"Unexpected SQL result: {lines[:3]}")
+    names = [part.strip() for part in lines[0].split("|")]
+    values = [part.strip() for part in lines[1].split("|")]
+    if len(names) != len(values):
+        raise ValueError("SQL result has inconsistent columns")
+    return {key: float(value) for key, value in zip(names, values)}
+
+
+def _fit_productivity_states(values: list[float]) -> tuple[float, float, float, float, float]:
+    """Fit low and high productivity regimes on log industry-relative output."""
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    low = sum(ordered[:middle]) / middle
+    high = sum(ordered[middle:]) / (len(ordered) - middle)
+    spread = max(sum((x - sum(ordered) / len(ordered)) ** 2 for x in ordered) / len(ordered), 0.0025)
+    prior = 0.5
+    for _ in range(100):
+        weights = []
+        for x in values:
+            a = prior * math.exp(-((x - high) ** 2) / (2 * spread))
+            b = (1 - prior) * math.exp(-((x - low) ** 2) / (2 * spread))
+            weights.append(a / (a + b) if a + b else 0.5)
+        high_n = sum(weights)
+        low_n = len(values) - high_n
+        if min(high_n, low_n) < 1:
+            break
+        high = sum(w * x for w, x in zip(weights, values)) / high_n
+        low = sum((1 - w) * x for w, x in zip(weights, values)) / low_n
+        spread = max(sum(w * (x - high) ** 2 + (1 - w) * (x - low) ** 2 for w, x in zip(weights, values)) / len(values), 0.0025)
+        prior = high_n / len(values)
+    return low, high, spread, prior, (low + high) / 2
+
+
+def _high_state_probability(x: float, state: tuple[float, float, float, float, float]) -> float:
+    low, high, spread, prior, _ = state
+    a = prior * math.exp(-((x - high) ** 2) / (2 * spread))
+    b = (1 - prior) * math.exp(-((x - low) ** 2) / (2 * spread))
+    return a / (a + b) if a + b else 0.5
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
-    """Run your agent and return its verdicts on CHOSEN_POINTS for every company.
+    """Use the supplied tools, then propagate measurement uncertainty."""
+    import random
 
-    ``companies`` maps each company folder name to its four LangChain tools:
+    chosen = check_chosen_points(CHOSEN_POINTS)
+    if chosen != [1, 3, 7]:
+        raise ValueError("This analysis implements Fisher points 1, 3 and 7")
+    semaphore = asyncio.Semaphore(4)
 
-        list_documents()             names and dates of the company's documents
-        read_document(name)          the text of one document
-        sql_query(query)             one read-only SQLite query on company.db
-        interview(role, topic)       one interview answer (INTERVIEW_LIMIT per company)
+    async def gather_one(name: str, company_tools: list[Any]) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                tools = {item.name: item for item in company_tools}
+                sql = tools["sql_query"]
+                growth = _single_sql_row(sql, """
+                    WITH revenue AS (
+                      SELECT SUM(CASE WHEN order_date >= '2023-01-01' AND order_date < '2024-01-01' THEN amount ELSE 0 END) AS prior,
+                             SUM(CASE WHEN order_date >= '2025-01-01' AND order_date < '2026-01-01' THEN amount ELSE 0 END) AS current
+                      FROM orders)
+                    SELECT revenue.prior, revenue.current, i.revenue_growth_2y_pct AS benchmark
+                    FROM revenue, company c JOIN industry_medians i ON i.industry = c.industry
+                """)
+                product = _single_sql_row(sql, """
+                    WITH sales AS (
+                      SELECT SUM(o.amount) AS new_sales, COUNT(*) AS order_count,
+                             SUM(o.amount * o.amount) AS sum_squares
+                      FROM orders o JOIN products p ON o.product = p.product
+                      WHERE o.order_date >= '2025-01-01' AND o.order_date < '2026-01-01'
+                        AND p.launch_date >= '2023-01-01' AND p.launch_date < '2026-01-01'),
+                    spending AS (
+                      SELECT SUM(research_development) AS rd FROM monthly_costs
+                      WHERE month >= '2025-01' AND month < '2026-01')
+                    SELECT sales.new_sales, sales.order_count, sales.sum_squares,
+                           spending.rd, i.new_product_sales_per_rd AS benchmark
+                    FROM sales, spending, company c JOIN industry_medians i ON i.industry = c.industry
+                """)
+                if min(growth["prior"], product["rd"], product["benchmark"], product["order_count"]) <= 0:
+                    raise ValueError("Missing or nonpositive financial denominator")
+                growth_pct = 100 * (growth["current"] / growth["prior"] - 1)
+                relative = product["new_sales"] / product["rd"] / product["benchmark"]
+                if relative <= 0:
+                    raise ValueError("Nonpositive new-product productivity")
+                answer = tools["interview"].invoke({"role": "current_employee", "topic": "working_conditions"})
+                response = await agent.ainvoke([{"role": "system", "content":
+                    "Judge Fisher point 7 from this employee statement alone. PASS for specific positive employee relations evidence; FAIL for clear problems or absent positive evidence. Return JSON with verdict (PASS/FAIL) and a brief rationale. Do not invent facts."},
+                    {"role": "user", "content": answer}])
+                raw = response.content
+                if isinstance(raw, list):
+                    raw = "".join(str(part.get("text", "")) for part in raw if isinstance(part, dict))
+                raw = str(raw)
+                decision = json.JSONDecoder().raw_decode(raw[raw.find("{"):])[0]
+                employee = normalize_verdict(decision.get("verdict"))
+                if employee is None:
+                    raise ValueError("Invalid employee-relations verdict")
+                return {"growth_pct": growth_pct, "growth_benchmark": growth["benchmark"],
+                        "product": product, "relative": relative, "employee": employee,
+                        "employee_reason": str(decision.get("rationale", "")).strip()}
+            except Exception as exc:
+                return {"error": f"{type(exc).__name__}: {exc}"}
 
-    Give the tools to a tool-calling agent, e.g.
-    ``create_agent(model, tools=companies[name], system_prompt=...)``, or call
-    them yourself with ``tool.invoke({...})``. The README explains the
-    documents, the database tables and the interview roles and topics.
-
-    Return one dictionary per company folder name, e.g. with
-    CHOSEN_POINTS = [1, 7, 15]:
-
-        {
-            "hollins_group": {
-                "points": {1: "PASS", 7: "FAIL", 15: "PASS"},
-                "summary": "Two or three sentences explaining the verdicts.",
-            },
-            ...
-        }
-
-    Each chosen point needs a verdict ("PASS" or "FAIL"; True/False also
-    works). Other points are ignored.
-
-    Catch errors per company (e.g. a failed API call) and still return an
-    entry for it: an exception here means no results.csv, which scores zero.
-    You may analyse companies in parallel (e.g. ``asyncio.gather``).
-    """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    names = list(companies)
+    observations = await asyncio.gather(*(gather_one(name, companies[name]) for name in names))
+    evidence = dict(zip(names, observations))
+    valid_logs = [math.log(item["relative"]) for item in observations if "relative" in item]
+    state = _fit_productivity_states(valid_logs) if len(valid_logs) >= 4 else None
+    output: dict[str, dict[str, Any]] = {}
+    for name, item in evidence.items():
+        if "error" in item or state is None:
+            output[name] = {"points": {point: None for point in chosen},
+                            "summary": item.get("error", "Too few companies for relative assessment")}
+            continue
+        product = item["product"]
+        count = product["order_count"]
+        average = product["new_sales"] / count
+        variance = max(product["sum_squares"] / count - average * average, 0)
+        relative_se = math.sqrt(variance / count) / average if average else 0
+        # Orders are observed transactions. Resampling their aggregate reflects
+        # measurement variation; it does not prove R&D caused the sales.
+        rng = random.Random(zlib.crc32(name.encode("utf-8")))
+        probabilities = []
+        for _ in range(400):
+            sampled_log = math.log(item["relative"]) + rng.gauss(0, relative_se)
+            probabilities.append(_high_state_probability(sampled_log, state))
+        support = sum(probabilities) / len(probabilities)
+        points = {1: "PASS" if item["growth_pct"] > item["growth_benchmark"] else "FAIL",
+                  3: "PASS" if support > 0.5 else "FAIL", 7: item["employee"]}
+        ratio = item["relative"] * product["benchmark"]
+        output[name] = {"points": points,
+            "summary": (f"Point 1: {points[1]}; two-year revenue growth {item['growth_pct']:.2f}% "
+                        f"versus industry median {item['growth_benchmark']:.2f}%. "
+                        f"Point 3: {points[3]}; new-product sales per FY2025 R&D {ratio:.2f} "
+                        f"versus industry median {product['benchmark']:.2f}; "
+                        f"high-productivity state support {support:.1%} under order variation. "
+                        "The sales/R&D timing mismatch limits causal attribution. "
+                        f"Point 7: {points[7]}; {item['employee_reason']}")}
+    return output
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
